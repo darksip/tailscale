@@ -73,6 +73,7 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/systemd"
 	"tailscale.com/util/uniq"
+	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -113,6 +114,23 @@ var newSSHServer newSSHServerFunc // or nil
 // RegisterNewSSHServer lets the conditionally linked ssh/tailssh package register itself.
 func RegisterNewSSHServer(fn newSSHServerFunc) {
 	newSSHServer = fn
+}
+
+// Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
+func GetRegCidrValues() []netip.Prefix {
+	cv := winutil.GetRegStrings("CidrExclusion", nil)
+	if cv == nil {
+		winutil.SetRegStrings("CidrExclusion", []string{})
+		return []netip.Prefix{}
+	}
+	var cidrs []netip.Prefix
+	for _, c := range cv {
+		p, err := netip.ParsePrefix(c)
+		if err == nil {
+			cidrs = append(cidrs, p)
+		}
+	}
+	return cidrs
 }
 
 // LocalBackend is the glue between the major pieces of the Tailscale
@@ -3424,6 +3442,12 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 		if runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 			rs.LocalRoutes = internalIPs // unconditionally allow access to guest VM networks
 			if prefs.ExitNodeAllowLANAccess() {
+
+				excludeCidr := GetRegCidrValues()
+				if len(excludeCidr) > 0 {
+					rs.LocalRoutes = append(rs.LocalRoutes, excludeCidr...)
+				}
+
 				rs.LocalRoutes = append(rs.LocalRoutes, externalIPs...)
 			} else {
 				// Explicitly add routes to the local network so that we do not

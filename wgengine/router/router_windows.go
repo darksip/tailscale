@@ -243,7 +243,11 @@ func (ft *firewallTweaker) doSet(local []string, killswitch bool, clear bool, pr
 		// TODO(bradfitz): care? That'd involve querying it before/after to see
 		// whether it was necessary/worked. But the output format is localized,
 		// so can't rely on parsing English. Maybe need to use OLE, not netsh.exe?
-		d, _ := ft.runFirewall("delete", "rule", "name=Tailscale-In", "dir=in")
+		d, err := ft.runFirewall("delete", "rule", "name=Tailscale-In", "dir=in")
+		if err != nil {
+			ft.logf("error to ignore:")
+			ft.logf(err.Error())
+		}
 		ft.logf("cleared Tailscale-In firewall rules in %v", d)
 	}
 	if procRule {
