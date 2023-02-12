@@ -102,9 +102,6 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 			continue
 		}
 		ifcIsLoopback := isLoopback(stdIf)
-		// view interface
-		fmt.Printf("iface %s [%s]", iface.Name, iface.HardwareAddr)
-
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return nil, nil, err
@@ -117,9 +114,6 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 					continue
 				}
 				ip = ip.Unmap()
-				if ip.Is4() {
-					fmt.Printf(" %s ", ip.String())
-				}
 
 				// TODO(apenwarr): don't special case cgNAT.
 				// In the general wireguard case, it might
@@ -155,7 +149,6 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 				}
 			}
 		}
-		fmt.Println()
 	}
 	if len(regular4) == 0 && len(regular6) == 0 {
 		// if we have no usable IP addresses then be willing to accept

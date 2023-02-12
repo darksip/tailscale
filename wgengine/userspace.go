@@ -924,11 +924,10 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 
 	if routerChanged {
 		e.logf("wgengine: Reconfig: configuring router")
-		// want to see the local routes
+		e.logf("local routes are now: ")
 		for _, r := range routerCfg.LocalRoutes {
 			e.logf(r.Addr().String())
 		}
-		/////////////
 		e.networkLogger.ReconfigRoutes(routerCfg)
 		err := e.router.Set(routerCfg)
 		health.SetRouterHealth(err)
