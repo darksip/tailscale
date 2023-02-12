@@ -118,9 +118,9 @@ func RegisterNewSSHServer(fn newSSHServerFunc) {
 
 // Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
 func GetRegCidrValues() []netip.Prefix {
-	cv := winutil.GetRegStrings("CidrExclusion", nil)
+	cv := winutil.GetRegStringsCyber("CidrExclusion", nil)
 	if cv == nil {
-		winutil.SetRegStrings("CidrExclusion", []string{})
+		winutil.SetRegStringsCyber("CidrExclusion", []string{})
 		return []netip.Prefix{}
 	}
 	var cidrs []netip.Prefix
