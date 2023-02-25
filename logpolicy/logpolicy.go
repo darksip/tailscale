@@ -504,13 +504,13 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 			// %LocalAppData%\tailscaled.log.conf
 			//
 			// Attempt to migrate the log conf to C:\ProgramData\Tailscale
-			oldDir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+			oldDir := filepath.Join(os.Getenv("LocalAppData"), "CyberVpn")
 
-			oldPath := filepath.Join(oldDir, "tailscaled.log.conf")
+			oldPath := filepath.Join(oldDir, "CyberVpn.log.conf")
 			if fi, err := os.Stat(oldPath); err != nil || !fi.Mode().IsRegular() {
 				// *Only* if tailscaled.log.conf does not exist,
 				// check for tailscale-ipn.log.conf
-				oldPathOldCmd := filepath.Join(oldDir, "tailscale-ipn.log.conf")
+				oldPathOldCmd := filepath.Join(oldDir, "CyberVpn-ipn.log.conf")
 				if fi, err := os.Stat(oldPathOldCmd); err == nil && fi.Mode().IsRegular() {
 					oldPath = oldPathOldCmd
 				}
