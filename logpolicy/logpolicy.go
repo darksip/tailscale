@@ -212,13 +212,13 @@ func logsDir(logf logger.Logf) string {
 			// as a regular user (perhaps in userspace-networking/SOCK5 mode) and we should
 			// just use the %LocalAppData% instead. In a user context, %LocalAppData% isn't
 			// subject to random deletions from Windows system updates.
-			dir := filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+			dir := filepath.Join(os.Getenv("ProgramData"), "Cybervpn")
 			if winProgramDataAccessible(dir) {
 				logf("logpolicy: using dir %v", dir)
 				return dir
 			}
 		}
-		dir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+		dir := filepath.Join(os.Getenv("LocalAppData"), "Cybervpn")
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
@@ -242,7 +242,7 @@ func logsDir(logf logger.Logf) string {
 
 	cacheDir, err := os.UserCacheDir()
 	if err == nil {
-		d := filepath.Join(cacheDir, "Tailscale")
+		d := filepath.Join(cacheDir, "Cybervpn")
 		logf("logpolicy: using UserCacheDir, %q", d)
 		return d
 	}

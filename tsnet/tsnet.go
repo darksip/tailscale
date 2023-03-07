@@ -425,7 +425,7 @@ func (s *Server) start() (reterr error) {
 		return fmt.Errorf("%v is not a directory", s.rootPath)
 	}
 
-	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
+	cfgPath := filepath.Join(s.rootPath, "cybervpnd.log.conf")
 
 	lpc, err := logpolicy.ConfigFromFile(cfgPath)
 	switch {
@@ -442,7 +442,7 @@ func (s *Server) start() (reterr error) {
 	}
 	s.logid = lpc.PublicID.String()
 
-	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
+	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "cybervpnd"), filch.Options{ReplaceStderr: false})
 	if err != nil {
 		return fmt.Errorf("error creating filch: %w", err)
 	}

@@ -22,7 +22,7 @@ var AppSharedDir syncs.AtomicValue[string]
 // or the empty string if there's no reasonable default.
 func DefaultTailscaledSocket() string {
 	if runtime.GOOS == "windows" {
-		return `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled`
+		return `\\.\pipe\ProtectedPrefix\Administrators\Cybervpn\cybervpnd`
 	}
 	if runtime.GOOS == "darwin" {
 		return "/var/run/tailscaled.socket"
