@@ -3326,7 +3326,7 @@ var (
 // peerRoutes returns the routerConfig.Routes to access peers.
 // If there are over cgnatThreshold CGNAT routes, one big CGNAT route
 // is used instead.
-func peerRoutes(peers []wgcfg.Peer, cgnatThreshold int) (routes []netip.Prefix) {
+func peerRoutes(logf logger.Logf, peers []wgcfg.Peer, cgnatThreshold int) (routes []netip.Prefix) {
 	tsULA := tsaddr.TailscaleULARange()
 	cgNAT := tsaddr.CGNATRange()
 	var didULA bool
@@ -3334,6 +3334,18 @@ func peerRoutes(peers []wgcfg.Peer, cgnatThreshold int) (routes []netip.Prefix) 
 	for _, peer := range peers {
 		for _, aip := range peer.AllowedIPs {
 			aip = unmapIPPrefix(aip)
+
+			// Ensure that we're only accepting properly-masked
+			// prefixes; the control server should be masking
+			// these, so if we get them, skip.
+			if mm := aip.Masked(); aip != mm {
+				// To avoid a DoS where a peer could cause all
+				// reconfigs to fail by sending a bad prefix, we just
+				// skip, but don't error, on an unmasked route.
+				logf("advertised route %s from %s has non-address bits set; expected %s", aip, peer.PublicKey.ShortString(), mm)
+				continue
+			}
+
 			// Only add the Tailscale IPv6 ULA once, if we see anybody using part of it.
 			if aip.Addr().Is6() && aip.IsSingleIP() && tsULA.Contains(aip.Addr()) {
 				if !didULA {
@@ -3366,12 +3378,13 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 	if oneCGNATRoute {
 		singleRouteThreshold = 1
 	}
+
 	rs := &router.Config{
 		LocalAddrs:       unmapIPPrefixes(cfg.Addresses),
 		SubnetRoutes:     unmapIPPrefixes(prefs.AdvertiseRoutes().AsSlice()),
 		SNATSubnetRoutes: !prefs.NoSNAT(),
 		NetfilterMode:    prefs.NetfilterMode(),
-		Routes:           peerRoutes(cfg.Peers, singleRouteThreshold),
+		Routes:           peerRoutes(b.logf, cfg.Peers, singleRouteThreshold),
 	}
 
 	if distro.Get() == distro.Synology {
@@ -3669,6 +3682,21 @@ func (b *LocalBackend) resetControlClientLockedAsync() {
 	if b.cc == nil {
 		return
 	}
+
+	// When we clear the control client, stop any outstanding netmap expiry
+	// timer; synthesizing a new netmap while we don't have a control
+	// client will break things.
+	//
+	// See https://github.com/tailscale/tailscale/issues/7392
+	if b.nmExpiryTimer != nil {
+		b.nmExpiryTimer.Stop()
+		b.nmExpiryTimer = nil
+
+		// Also bump the epoch to ensure that if the timer started, it
+		// will abort.
+		b.numClientStatusCalls.Add(1)
+	}
+
 	go b.cc.Shutdown()
 	b.cc = nil
 	b.ccAuto = nil
@@ -4740,6 +4768,9 @@ func (b *LocalBackend) initTKALocked() error {
 		if err != nil {
 			return fmt.Errorf("initializing tka: %v", err)
 		}
+		if err := authority.Compact(storage, tkaCompactionDefaults); err != nil {
+			b.logf("tka compaction failed: %v", err)
+		}
 
 		b.tka = &tkaState{
 			profile:   cp.ID,
@@ -4865,4 +4896,26 @@ func (b *LocalBackend) StreamDebugCapture(ctx context.Context, w io.Writer) erro
 		return s.Close()
 	}
 	return nil
+}
+
+func (b *LocalBackend) GetPeerEndpointChanges(ctx context.Context, ip netip.Addr) ([]magicsock.EndpointChange, error) {
+	pip, ok := b.e.PeerForIP(ip)
+	if !ok {
+		return nil, fmt.Errorf("no matching peer")
+	}
+	if pip.IsSelf {
+		return nil, fmt.Errorf("%v is local Tailscale IP", ip)
+	}
+	peer := pip.Node
+
+	mc, err := b.magicConn()
+	if err != nil {
+		return nil, fmt.Errorf("getting magicsock conn: %w", err)
+	}
+
+	chs, err := mc.GetEndpointChanges(peer)
+	if err != nil {
+		return nil, fmt.Errorf("getting endpoint changes: %w", err)
+	}
+	return chs, nil
 }

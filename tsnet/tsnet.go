@@ -8,6 +8,8 @@ package tsnet
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -36,9 +38,12 @@ import (
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
 	"tailscale.com/net/memnet"
+	"tailscale.com/net/proxymux"
+	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/util/mak"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/monitor"
@@ -93,14 +98,18 @@ type Server struct {
 	lb               *ipnlocal.LocalBackend
 	netstack         *netstack.Impl
 	linkMon          *monitor.Mon
-	localAPIListener net.Listener
 	rootPath         string // the state directory
 	hostname         string
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
-	localClient      *tailscale.LocalClient
+	proxyCred        string                 // SOCKS5 proxy auth for loopbackListener
+	localAPICred     string                 // basic auth password for loopbackListener
+	loopbackListener net.Listener           // optional loopback for localapi and proxies
+	localAPIListener net.Listener           // in-memory, used by localClient
+	localClient      *tailscale.LocalClient // in-memory
 	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
+	logid            string
 
 	mu        sync.Mutex
 	listeners map[listenKey]*listener
@@ -139,6 +148,94 @@ func (s *Server) LocalClient() (*tailscale.LocalClient, error) {
 	return s.localClient, nil
 }
 
+// Loopback starts a routing server on a loopback address.
+//
+// The server has multiple functions.
+//
+// It can be used as a SOCKS5 proxy onto the tailnet.
+// Authentication is required with the username "tsnet" and
+// the value of proxyCred used as the password.
+//
+// The HTTP server also serves out the "LocalAPI" on /localapi.
+// As the LocalAPI is powerful, access to endpoints requires BOTH passing a
+// "Sec-Tailscale: localapi" HTTP header and passing localAPICred as basic auth.
+//
+// If you only need to use the LocalAPI from Go, then prefer LocalClient
+// as it does not require communication via TCP.
+func (s *Server) Loopback() (addr string, proxyCred, localAPICred string, err error) {
+	if err := s.Start(); err != nil {
+		return "", "", "", err
+	}
+
+	if s.loopbackListener == nil {
+		var proxyCred [16]byte
+		if _, err := crand.Read(proxyCred[:]); err != nil {
+			return "", "", "", err
+		}
+		s.proxyCred = hex.EncodeToString(proxyCred[:])
+
+		var cred [16]byte
+		if _, err := crand.Read(cred[:]); err != nil {
+			return "", "", "", err
+		}
+		s.localAPICred = hex.EncodeToString(cred[:])
+
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return "", "", "", err
+		}
+		s.loopbackListener = ln
+
+		socksLn, httpLn := proxymux.SplitSOCKSAndHTTP(ln)
+
+		// TODO: add HTTP proxy support. Probably requires factoring
+		// out the CONNECT code from tailscaled/proxy.go that uses
+		// httputil.ReverseProxy and adding auth support.
+		go func() {
+			lah := localapi.NewHandler(s.lb, s.logf, s.logid)
+			lah.PermitWrite = true
+			lah.PermitRead = true
+			lah.RequiredPassword = s.localAPICred
+			h := &localSecHandler{h: lah, cred: s.localAPICred}
+
+			if err := http.Serve(httpLn, h); err != nil {
+				s.logf("localapi tcp serve error: %v", err)
+			}
+		}()
+
+		s5s := &socks5.Server{
+			Logf:     logger.WithPrefix(s.logf, "socks5: "),
+			Dialer:   s.dialer.UserDial,
+			Username: "tsnet",
+			Password: s.proxyCred,
+		}
+		go func() {
+			s.logf("SOCKS5 server exited: %v", s5s.Serve(socksLn))
+		}()
+	}
+
+	lbAddr := s.loopbackListener.Addr()
+	if lbAddr == nil {
+		// https://github.com/tailscale/tailscale/issues/7488
+		panic("loopbackListener has no Addr")
+	}
+	return lbAddr.String(), s.proxyCred, s.localAPICred, nil
+}
+
+type localSecHandler struct {
+	h    http.Handler
+	cred string
+}
+
+func (h *localSecHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Sec-Tailscale") != "localapi" {
+		w.WriteHeader(403)
+		io.WriteString(w, "missing 'Sec-Tailscale: localapi' header")
+		return
+	}
+	h.h.ServeHTTP(w, r)
+}
+
 // Start connects the server to the tailnet.
 // Optional: any calls to Dial/Listen will also call Start.
 func (s *Server) Start() error {
@@ -170,8 +267,7 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 			return nil, fmt.Errorf("tsnet.Up: backend: %s", *n.ErrMessage)
 		}
 		if s := n.State; s != nil {
-			switch *s {
-			case ipn.Running:
+			if *s == ipn.Running {
 				status, err := lc.Status(ctx)
 				if err != nil {
 					return nil, fmt.Errorf("tsnet.Up: %w", err)
@@ -180,15 +276,13 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 					return nil, errors.New("tsnet.Up: running, but no ip")
 				}
 				return status, nil
-			case ipn.NeedsMachineAuth:
-				return nil, errors.New("tsnet.Up: tailnet requested machine auth")
 			}
-			// TODO: in the future, return an error on NeedsLogin
-			// to improve the UX of trying out the tsnet package.
+			// TODO: in the future, return an error on ipn.NeedsLogin
+			// and ipn.NeedsMachineAuth to improve the UX of trying
+			// out the tsnet package.
 			//
 			// Unfortunately today, even when using an AuthKey we
-			// briefly see a NeedsLogin state. It would be nice
-			// to fix that.
+			// briefly see these states. It would be nice to fix.
 		}
 	}
 }
@@ -240,6 +334,9 @@ func (s *Server) Close() error {
 	if s.localAPIListener != nil {
 		s.localAPIListener.Close()
 	}
+	if s.loopbackListener != nil {
+		s.loopbackListener.Close()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -257,6 +354,24 @@ func (s *Server) doInit() {
 	if err := s.start(); err != nil {
 		s.initErr = fmt.Errorf("tsnet: %w", err)
 	}
+}
+
+// TailscaleIPs returns IPv4 and IPv6 addresses for this node. If the node
+// has not yet joined a tailnet or is otherwise unaware of its own IP addresses,
+// the returned ip4, ip6 will be !netip.IsValid().
+func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
+	nm := s.lb.NetMap()
+	for _, addr := range nm.Addresses {
+		ip := addr.Addr()
+		if ip.Is6() {
+			ip6 = ip
+		}
+		if ip.Is4() {
+			ip4 = ip
+		}
+	}
+
+	return ip4, ip6
 }
 
 func (s *Server) getAuthKey() string {
@@ -325,7 +440,7 @@ func (s *Server) start() (reterr error) {
 	if err := lpc.Validate(logtail.CollectionNode); err != nil {
 		return fmt.Errorf("logpolicy.Config.Validate for %v: %w", cfgPath, err)
 	}
-	logid := lpc.PublicID.String()
+	s.logid = lpc.PublicID.String()
 
 	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
 	if err != nil {
@@ -377,6 +492,7 @@ func (s *Server) start() (reterr error) {
 	}
 	ns.ProcessLocalIPs = true
 	ns.ForwardTCPIn = s.forwardTCP
+	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		_, ok := eng.PeerForIP(ip)
@@ -399,7 +515,7 @@ func (s *Server) start() (reterr error) {
 	if s.Ephemeral {
 		loginFlags = controlclient.LoginEphemeral
 	}
-	lb, err := ipnlocal.NewLocalBackend(logf, logid, s.Store, s.dialer, eng, loginFlags)
+	lb, err := ipnlocal.NewLocalBackend(logf, s.logid, s.Store, s.dialer, eng, loginFlags)
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
@@ -435,7 +551,7 @@ func (s *Server) start() (reterr error) {
 	go s.printAuthURLLoop()
 
 	// Run the localapi handler, to allow fetching LetsEncrypt certs.
-	lah := localapi.NewHandler(lb, logf, logid)
+	lah := localapi.NewHandler(lb, logf, s.logid)
 	lah.PermitWrite = true
 	lah.PermitRead = true
 
@@ -499,21 +615,73 @@ func (s *Server) printAuthURLLoop() {
 	}
 }
 
-func (s *Server) forwardTCP(c net.Conn, port uint16) {
+// networkForFamily returns one of "tcp4", "tcp6", "udp4", or "udp6".
+//
+// netBase is "tcp" or "udp" (without any '4' or '6' suffix).
+func networkForFamily(netBase string, is6 bool) string {
+	switch netBase {
+	case "tcp":
+		if is6 {
+			return "tcp6"
+		}
+		return "tcp4"
+	case "udp":
+		if is6 {
+			return "udp6"
+		}
+		return "udp4"
+	}
+	panic("unexpected")
+}
+
+// listenerForDstAddr returns a listener for the provided network and
+// destination IP/port. It matches from most specific to least specific.
+// For example:
+//
+//   - ("tcp4", IP, port)
+//   - ("tcp", IP, port)
+//   - ("tcp4", "", port)
+//   - ("tcp", "", port)
+//
+// The netBase is "tcp" or "udp" (without any '4' or '6' suffix).
+func (s *Server) listenerForDstAddr(netBase string, dst netip.AddrPort) (_ *listener, ok bool) {
 	s.mu.Lock()
-	ln, ok := s.listeners[listenKey{"tcp", "", port}]
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	for _, a := range [2]netip.Addr{0: dst.Addr()} {
+		for _, net := range [2]string{
+			networkForFamily(netBase, dst.Addr().Is6()),
+			netBase,
+		} {
+			if ln, ok := s.listeners[listenKey{net, a, dst.Port()}]; ok {
+				return ln, true
+			}
+		}
+	}
+	return nil, false
+}
+
+func (s *Server) forwardTCP(c net.Conn, port uint16) {
+	dstStr := c.LocalAddr().String()
+	ap, err := netip.ParseAddrPort(dstStr)
+	if err != nil {
+		s.logf("unexpected dst addr %q", dstStr)
+		c.Close()
+		return
+	}
+	ln, ok := s.listenerForDstAddr("tcp", ap)
 	if !ok {
 		c.Close()
 		return
 	}
-	t := time.NewTimer(time.Second)
-	defer t.Stop()
-	select {
-	case ln.conn <- c:
-	case <-t.C:
-		c.Close()
+	ln.handle(c)
+}
+
+func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+	ln, ok := s.listenerForDstAddr("udp", dst)
+	if !ok {
+		return nil, true // don't handle, don't forward to localhost
 	}
+	return func(c nettype.ConnPacketConn) { ln.handle(c) }, true
 }
 
 // getTSNetDir usually just returns filepath.Join(confDir, "tsnet-"+prog)
@@ -579,7 +747,7 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 // It will start the server if it has not been started yet.
 func (s *Server) Listen(network, addr string) (net.Listener, error) {
 	switch network {
-	case "", "tcp", "tcp4", "tcp6":
+	case "", "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
 	default:
 		return nil, errors.New("unsupported network type")
 	}
@@ -589,13 +757,30 @@ func (s *Server) Listen(network, addr string) (net.Listener, error) {
 	}
 	port, err := net.LookupPort(network, portStr)
 	if err != nil || port < 0 || port > math.MaxUint16 {
+		// LookupPort returns an error on out of range values so the bounds
+		// checks on port should be unnecessary, but harmless. If they do
+		// match, worst case this error message says "invalid port: <nil>".
 		return nil, fmt.Errorf("invalid port: %w", err)
 	}
+	var bindHostOrZero netip.Addr
+	if host != "" {
+		bindHostOrZero, err = netip.ParseAddr(host)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Listen addr %q; host part must be empty or IP literal", host)
+		}
+		if strings.HasSuffix(network, "4") && !bindHostOrZero.Is4() {
+			return nil, fmt.Errorf("invalid non-IPv4 addr %v for network %q", host, network)
+		}
+		if strings.HasSuffix(network, "6") && !bindHostOrZero.Is6() {
+			return nil, fmt.Errorf("invalid non-IPv6 addr %v for network %q", host, network)
+		}
+	}
+
 	if err := s.Start(); err != nil {
 		return nil, err
 	}
 
-	key := listenKey{network, host, uint16(port)}
+	key := listenKey{network, bindHostOrZero, uint16(port)}
 	ln := &listener{
 		s:    s,
 		key:  key,
@@ -615,7 +800,7 @@ func (s *Server) Listen(network, addr string) (net.Listener, error) {
 
 type listenKey struct {
 	network string
-	host    string
+	host    netip.Addr // or zero value for unspecified
 	port    uint16
 }
 
@@ -643,6 +828,18 @@ func (ln *listener) Close() error {
 		close(ln.conn)
 	}
 	return nil
+}
+
+func (ln *listener) handle(c net.Conn) {
+	t := time.NewTimer(time.Second)
+	defer t.Stop()
+	select {
+	case ln.conn <- c:
+	case <-t.C:
+		// TODO(bradfitz): this isn't ideal. Think about how
+		// we how we want to do pushback.
+		c.Close()
+	}
 }
 
 // Server returns the tsnet Server associated with the listener.
