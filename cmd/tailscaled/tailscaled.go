@@ -168,7 +168,7 @@ func main() {
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
-	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
+	flag.BoolVar(&args.disableLogs, "no-logs-no-support", true, "disable log uploads; this also disables any technical support")
 
 	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" && beCLI != nil {
 		beCLI()
@@ -351,8 +351,9 @@ func run() error {
 		log.Printf("Service ended.")
 		return nil
 	}
-
+	log.SetFlags(log.Ltime)
 	var logf logger.Logf = log.Printf
+
 	if envknob.Bool("TS_DEBUG_MEMORY") {
 		logf = logger.RusagePrefixLog(logf)
 	}
