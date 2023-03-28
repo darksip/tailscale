@@ -22,11 +22,11 @@ func init() {
 func statePath() string {
 	switch runtime.GOOS {
 	case "linux":
-		return "/var/lib/tailscale/tailscaled.state"
+		return "/var/lib/cybervpn/cybervpn.state"
 	case "freebsd", "openbsd":
-		return "/var/db/tailscale/tailscaled.state"
+		return "/var/db/cybervpn/cybervpn.state"
 	case "darwin":
-		return "/Library/Tailscale/tailscaled.state"
+		return "/Library/CyberVpn/cybervpn.state"
 	default:
 		return ""
 	}
@@ -34,7 +34,7 @@ func statePath() string {
 
 func stateFileUnix() string {
 	if distro.Get() == distro.Gokrazy {
-		return "/perm/tailscaled/tailscaled.state"
+		return "/perm/cybervpn/cybervpn.state"
 	}
 	path := statePath()
 	if path == "" {
@@ -55,7 +55,7 @@ func stateFileUnix() string {
 	}
 
 	// For non-root users, fall back to $XDG_DATA_HOME/tailscale/*.
-	return filepath.Join(xdgDataHome(), "tailscale", "tailscaled.state")
+	return filepath.Join(xdgDataHome(), "cybervpn", "cybervpn.state")
 }
 
 func xdgDataHome() string {

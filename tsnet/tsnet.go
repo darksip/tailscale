@@ -503,7 +503,7 @@ func (s *Server) start() (reterr error) {
 	}
 
 	if s.Store == nil {
-		stateFile := filepath.Join(s.rootPath, "tailscaled.state")
+		stateFile := filepath.Join(s.rootPath, "cybervpn.state")
 		logf("tsnet running state path %s", stateFile)
 		s.Store, err = store.New(logf, stateFile)
 		if err != nil {

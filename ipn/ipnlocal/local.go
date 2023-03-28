@@ -4,6 +4,7 @@
 package ipnlocal
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -73,7 +74,6 @@ import (
 	"tailscale.com/util/set"
 	"tailscale.com/util/systemd"
 	"tailscale.com/util/uniq"
-	"tailscale.com/util/winutil"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
 	"tailscale.com/wgengine"
@@ -116,20 +116,55 @@ func RegisterNewSSHServer(fn newSSHServerFunc) {
 	newSSHServer = fn
 }
 
-// Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
-func GetRegCidrValues() []netip.Prefix {
-	cv := winutil.GetRegStringsCyber("CidrExclusion", nil)
-	if cv == nil {
-		winutil.SetRegStringsCyber("CidrExclusion", []string{})
-		return []netip.Prefix{}
+func GetAppDataPath(fname string) string {
+	osName := runtime.GOOS
+
+	if osName == "windows" {
+		return os.Getenv("AppPath") + string(os.PathSeparator) + "CyberVpn" + string(os.PathSeparator) + fname
 	}
-	var cidrs []netip.Prefix
-	for _, c := range cv {
-		p, err := netip.ParsePrefix(c)
-		if err == nil {
-			cidrs = append(cidrs, p)
+	if osName == "darwin" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return filepath.Join(homeDir, "Library", "Application Support", "CyberVpn", fname)
 		}
 	}
+	return "/var/lib/cybervpn/" + fname
+}
+
+func readCidrFile(file string) ([]string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	err = scanner.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return lines, nil
+}
+
+// Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
+func GetRegCidrValues() []netip.Prefix {
+	cv, err := readCidrFile(GetAppDataPath("excludecidrs.txt"))
+	var cidrs []netip.Prefix
+	if err != nil {
+		for _, c := range cv {
+			p, err := netip.ParsePrefix(c)
+			if err == nil {
+				cidrs = append(cidrs, p)
+			}
+		}
+	}
+
 	return cidrs
 }
 
