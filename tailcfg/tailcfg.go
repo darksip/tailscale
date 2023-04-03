@@ -3,7 +3,7 @@
 
 package tailcfg
 
-//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHPrincipal,ControlDialPlan --clonefunc
+//go:generate go run tailscale.com/cmd/viewer --type=User,Node,Hostinfo,NetInfo,Login,DNSConfig,RegisterResponse,DERPRegion,DERPMap,DERPNode,SSHRule,SSHAction,SSHPrincipal,ControlDialPlan --clonefunc
 
 import (
 	"bytes"
@@ -94,7 +94,9 @@ type CapabilityVersion int
 //   - 55: 2023-01-23: start of c2n GET+POST /update handler
 //   - 56: 2023-01-24: Client understands CapabilityDebugTSDNSResolution
 //   - 57: 2023-01-25: Client understands CapabilityBindToInterfaceByRoute
-const CurrentCapabilityVersion CapabilityVersion = 57
+//   - 58: 2023-03-10: Client retries lite map updates before restarting map poll.
+//   - 59: 2023-03-16: Client understands Peers[].SelfNodeV4MasqAddrForThisPeer
+const CurrentCapabilityVersion CapabilityVersion = 59
 
 type StableID string
 
@@ -182,7 +184,12 @@ func (emptyStructJSONSlice) UnmarshalJSON([]byte) error { return nil }
 type Node struct {
 	ID       NodeID
 	StableID StableNodeID
-	Name     string // DNS
+
+	// Name is the FQDN of the node.
+	// It is also the MagicDNS name for the node.
+	// It has a trailing dot.
+	// e.g. "host.tail-scale.ts.net."
+	Name string
 
 	// User is the user who created the node. If ACL tags are in
 	// use for the node then it doesn't reflect the ACL identity
@@ -267,6 +274,21 @@ type Node struct {
 	// the client, this is calculated client-side based on a timestamp sent
 	// from control, to avoid clock skew issues.
 	Expired bool `json:",omitempty"`
+
+	// SelfNodeV4MasqAddrForThisPeer is the IPv4 that this peer knows the current node as.
+	// It may be empty if the peer knows the current node by its native
+	// IPv4 address.
+	// This field is only populated in a MapResponse for peers and not
+	// for the current node.
+	//
+	// If set, it should be used to masquerade traffic originating from the
+	// current node to this peer. The masquerade address is only relevant
+	// for this peer and not for other peers.
+	//
+	// This only applies to traffic originating from the current node to the
+	// peer or any of its subnets. Traffic originating from subnet routes will
+	// not be masqueraded (e.g. in case of --snat-subnet-routes).
+	SelfNodeV4MasqAddrForThisPeer netip.Addr `json:",omitempty"`
 }
 
 // DisplayName returns the user-facing name for a node which should
@@ -311,6 +333,11 @@ func (n *Node) DisplayNames(forOwner bool) (name, hostIfDifferent string) {
 		return n.ComputedName, n.computedHostIfDifferent
 	}
 	return n.ComputedName, ""
+}
+
+// IsTagged reports whether the node has any tags.
+func (n *Node) IsTagged() bool {
+	return len(n.Tags) > 0
 }
 
 // InitDisplayNames computes and populates n's display name
@@ -1058,6 +1085,11 @@ type PortRange struct {
 	Last  uint16
 }
 
+// Contains reports whether port is in pr.
+func (pr PortRange) Contains(port uint16) bool {
+	return port >= pr.First && port <= pr.Last
+}
+
 var PortRangeAny = PortRange{0, 65535}
 
 // NetPortRange represents a range of ports that's allowed for one or more IPs.
@@ -1682,7 +1714,8 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.computedHostIfDifferent == n2.computedHostIfDifferent &&
 		n.ComputedNameWithHost == n2.ComputedNameWithHost &&
 		eqStrings(n.Tags, n2.Tags) &&
-		n.Expired == n2.Expired
+		n.Expired == n2.Expired &&
+		n.SelfNodeV4MasqAddrForThisPeer == n2.SelfNodeV4MasqAddrForThisPeer
 }
 
 func eqBoolPtr(a, b *bool) bool {
@@ -1806,7 +1839,8 @@ const (
 
 	// Funnel warning capabilities used for reporting errors to the user.
 
-	// CapabilityWarnFunnelNoInvite indicates an invite has not been accepted for the Funnel alpha.
+	// CapabilityWarnFunnelNoInvite indicates whether Funnel is enabled for the tailnet.
+	// NOTE: In transition from Alpha to Beta, this capability is being reused as the enablement.
 	CapabilityWarnFunnelNoInvite = "https://tailscale.com/cap/warn-funnel-no-invite"
 
 	// CapabilityWarnFunnelNoHTTPS indicates HTTPS has not been enabled for the tailnet.
@@ -1818,6 +1852,12 @@ const (
 	// resolution for Tailscale-controlled domains (the control server, log
 	// server, DERP servers, etc.)
 	CapabilityDebugTSDNSResolution = "https://tailscale.com/cap/debug-ts-dns-resolution"
+
+	// CapabilityFunnelPorts specifies the ports that the Funnel is available on.
+	// The ports are specified as a comma-separated list of port numbers or port
+	// ranges (e.g. "80,443,8080-8090") in the ports query parameter.
+	// e.g. https://tailscale.com/cap/funnel-ports?ports=80,443,8080-8090
+	CapabilityFunnelPorts = "https://tailscale.com/cap/funnel-ports"
 )
 
 const (
@@ -1999,9 +2039,9 @@ type SSHAction struct {
 	// to use local port forwarding if requested.
 	AllowLocalPortForwarding bool `json:"allowLocalPortForwarding,omitempty"`
 
-	// SessionHaulTargetNode, if non-empty, is the Stable ID of a peer to
-	// stream this SSH session's logs to.
-	SessionHaulTargetNode StableNodeID `json:"sessionHaulTargetNode,omitempty"`
+	// Recorders defines the destinations of the SSH session recorders.
+	// The recording will be uploaded to http://addr:port/record.
+	Recorders []netip.AddrPort `json:"recorders"`
 }
 
 // OverTLSPublicKeyResponse is the JSON response to /key?v=<n>

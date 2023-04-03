@@ -83,6 +83,14 @@ func (b *LocalBackend) handleC2N(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(res)
+	case "/sockstats":
+		if r.Method != "POST" {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		b.sockstatLogger.Flush()
+		fmt.Fprintln(w, b.sockstatLogger.LogID())
 	default:
 		http.Error(w, "unknown c2n path", http.StatusBadRequest)
 	}

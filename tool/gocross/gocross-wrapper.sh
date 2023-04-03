@@ -19,8 +19,24 @@ fi
 (
 repo_root="$(dirname $0)/../.."
 
+# Figuring out if gocross needs a rebuild, as well as the rebuild itself, need
+# to happen with CWD inside this repo. Since we're in a subshell entirely
+# dedicated to wrangling gocross and toolchains, cd over now before doing
+# anything further so that the rest of this logic works the same if gocross is
+# being invoked from somewhere else.
+cd "$repo_root"
+
 toolchain="$HOME/.cache/tailscale-go"
 
+if [ -d "$toolchain" ]; then
+    # A toolchain exists, but is it recent enough to compile gocross? If not,
+    # wipe it out so that the next if block fetches a usable one.
+    want_go_minor=$(grep -E '^go ' "$repo_root/go.mod" | cut -f2 -d'.')
+    have_go_minor=$(cut -f2 -d'.' <$toolchain/VERSION)
+    if [ -z "$have_go_minor" -o "$have_go_minor" -lt "$want_go_minor" ]; then
+        rm -rf "$toolchain" "$toolchain.extracted"
+    fi
+fi
 if [ ! -d "$toolchain" ]; then
     mkdir -p "$HOME/.cache"
 
@@ -53,6 +69,7 @@ if [ ! -d "$toolchain" ]; then
         mkdir -p "$toolchain"
         (cd "$toolchain" && tar --strip-components=1 -xf "$toolchain.tar.gz")
         echo "$REV" >"$toolchain.extracted"
+        rm -f "$toolchain.tar.gz"
         ;;
     esac
 fi
@@ -65,9 +82,9 @@ fi
 # Anyway, build gocross in a stripped down universe.
 gocross_path="$repo_root/gocross"
 gocross_ok=0
+wantver="$(git rev-parse HEAD)"
 if [ -x "$gocross_path" ]; then
 	gotver="$($gocross_path gocross-version 2>/dev/null || echo '')"
-	wantver="$(git rev-parse HEAD)"
 	if [ "$gotver" = "$wantver" ]; then
 		gocross_ok=1
 	fi
@@ -78,7 +95,7 @@ if [ "$gocross_ok" = "0" ]; then
     unset GO111MODULE
     unset GOROOT
     export CGO_ENABLED=0
-    "$toolchain/bin/go" build -o "$gocross_path" -ldflags='-X tailscale.com/version/gitCommitStamp=$wantver' tailscale.com/tool/gocross
+    "$toolchain/bin/go" build -o "$gocross_path" -ldflags "-X tailscale.com/version.gitCommitStamp=$wantver" tailscale.com/tool/gocross
 fi
 ) # End of the subshell execution.
 

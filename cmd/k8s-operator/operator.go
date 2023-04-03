@@ -7,8 +7,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -25,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -235,15 +237,25 @@ waitOnline:
 
 	startlog.Infof("Startup complete, operator running")
 	if shouldRunAuthProxy {
-		rc, err := rest.TransportFor(restConfig)
+		cfg, err := restConfig.TransportConfig()
 		if err != nil {
-			startlog.Fatalf("could not get rest transport: %v", err)
+			startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
 		}
-		authProxyListener, err := s.Listen("tcp", ":443")
+
+		// Kubernetes uses SPDY for exec and port-forward, however SPDY is
+		// incompatible with HTTP/2; so disable HTTP/2 in the proxy.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig, err = transport.TLSConfigFor(cfg)
 		if err != nil {
-			startlog.Fatalf("could not listen on :443: %v", err)
+			startlog.Fatalf("could not get transport.TLSConfigFor(): %v", err)
 		}
-		go runAuthProxy(lc, authProxyListener, rc, zlog.Named("auth-proxy").Infof)
+		tr.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+
+		rt, err := transport.HTTPWrappersForConfig(cfg, tr)
+		if err != nil {
+			startlog.Fatalf("could not get rest.TransportConfig(): %v", err)
+		}
+		go runAuthProxy(s, rt, zlog.Named("auth-proxy").Infof)
 	}
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		startlog.Fatalf("could not start manager: %v", err)

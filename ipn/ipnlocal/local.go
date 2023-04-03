@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -34,6 +35,7 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/doctor"
+	"tailscale.com/doctor/permissions"
 	"tailscale.com/doctor/routetable"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -43,6 +45,8 @@ import (
 	"tailscale.com/ipn/ipnauth"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/policy"
+	"tailscale.com/log/sockstatlog"
+	"tailscale.com/logpolicy"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
@@ -60,6 +64,7 @@ import (
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
@@ -136,7 +141,7 @@ type LocalBackend struct {
 	pm                    *profileManager
 	store                 ipn.StateStore
 	dialer                *tsdial.Dialer // non-nil
-	backendLogID          string
+	backendLogID          logid.PublicID
 	unregisterLinkMon     func()
 	unregisterHealthWatch func()
 	portpoll              *portlist.Poller // may be nil
@@ -149,6 +154,23 @@ type LocalBackend struct {
 	sshAtomicBool         atomic.Bool
 	shutdownCalled        bool // if Shutdown has been called
 	debugSink             *capture.Sink
+	sockstatLogger        *sockstatlog.Logger
+
+	// getTCPHandlerForFunnelFlow returns a handler for an incoming TCP flow for
+	// the provided srcAddr and dstPort if one exists.
+	//
+	// srcAddr is the source address of the flow, not the address of the Funnel
+	// node relaying the flow.
+	// dstPort is the destination port of the flow.
+	//
+	// It returns nil if there is no known handler for this flow.
+	//
+	// This is specifically used to handle TCP flows for Funnel connections to tsnet
+	// servers.
+	//
+	// It is set once during initialization, and can be nil if SetTCPHandlerForFunnelFlow
+	// is never called.
+	getTCPHandlerForFunnelFlow func(srcAddr netip.AddrPort, dstPort uint16) (handler func(net.Conn))
 
 	// lastProfileID tracks the last profile we've seen from the ProfileManager.
 	// It's used to detect when the user has changed their profile.
@@ -245,7 +267,7 @@ type clientGen func(controlclient.Options) (controlclient.Client, error)
 // but is not actually running.
 //
 // If dialer is nil, a new one is made.
-func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, dialer *tsdial.Dialer, e wgengine.Engine, loginFlags controlclient.LoginFlags) (*LocalBackend, error) {
+func NewLocalBackend(logf logger.Logf, logID logid.PublicID, store ipn.StateStore, dialer *tsdial.Dialer, e wgengine.Engine, loginFlags controlclient.LoginFlags) (*LocalBackend, error) {
 	if e == nil {
 		panic("ipn.NewLocalBackend: engine must not be nil")
 	}
@@ -253,6 +275,9 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, diale
 	pm, err := newProfileManager(store, logf)
 	if err != nil {
 		return nil, err
+	}
+	if sds, ok := store.(ipn.StateStoreDialerSetter); ok {
+		sds.SetDialer(dialer.SystemDial)
 	}
 
 	hi := hostinfo.New()
@@ -278,14 +303,25 @@ func NewLocalBackend(logf logger.Logf, logid string, store ipn.StateStore, diale
 		statsLogf:      logger.LogOnChange(logf, 5*time.Minute, time.Now),
 		e:              e,
 		pm:             pm,
-		store:          pm.Store(),
+		store:          store,
 		dialer:         dialer,
-		backendLogID:   logid,
+		backendLogID:   logID,
 		state:          ipn.NoState,
 		portpoll:       portpoll,
 		em:             newExpiryManager(logf),
 		gotPortPollRes: make(chan struct{}),
 		loginFlags:     loginFlags,
+	}
+
+	// for now, only log sockstats on unstable builds
+	if version.IsUnstableBuild() {
+		b.sockstatLogger, err = sockstatlog.NewLogger(logpolicy.LogsDir(logf), logf, logID)
+		if err != nil {
+			log.Printf("error setting up sockstat logger: %v", err)
+		}
+		if b.sockstatLogger != nil {
+			b.sockstatLogger.SetLoggingEnabled(true)
+		}
 	}
 
 	// Default filter blocks everything and logs nothing, until Start() is called.
@@ -336,6 +372,7 @@ type componentLogState struct {
 
 var debuggableComponents = []string{
 	"magicsock",
+	"sockstats",
 }
 
 func componentStateKey(component string) ipn.StateKey {
@@ -348,6 +385,7 @@ func componentStateKey(component string) ipn.StateKey {
 // The following components are recognized:
 //
 //   - magicsock
+//   - sockstats
 func (b *LocalBackend) SetComponentDebugLogging(component string, until time.Time) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -360,6 +398,10 @@ func (b *LocalBackend) SetComponentDebugLogging(component string, until time.Tim
 			return err
 		}
 		setEnabled = mc.SetDebugLoggingEnabled
+	case "sockstats":
+		if b.sockstatLogger != nil {
+			setEnabled = b.sockstatLogger.SetLoggingEnabled
+		}
 	}
 	if setEnabled == nil || !slices.Contains(debuggableComponents, component) {
 		return fmt.Errorf("unknown component %q", component)
@@ -524,6 +566,10 @@ func (b *LocalBackend) Shutdown() {
 		b.debugSink = nil
 	}
 	b.mu.Unlock()
+
+	if b.sockstatLogger != nil {
+		b.sockstatLogger.Shutdown()
+	}
 
 	b.unregisterLinkMon()
 	b.unregisterHealthWatch()
@@ -1262,7 +1308,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 	}
 
 	hostinfo := hostinfo.New()
-	hostinfo.BackendLogID = b.backendLogID
+	hostinfo.BackendLogID = b.backendLogID.String()
 	hostinfo.FrontendLogID = opts.FrontendLogID
 	hostinfo.Userspace.Set(wgengine.IsNetstack(b.e))
 	hostinfo.UserspaceRouter.Set(wgengine.IsNetstackRouter(b.e))
@@ -1416,7 +1462,7 @@ func (b *LocalBackend) Start(opts ipn.Options) error {
 
 	b.e.SetNetInfoCallback(b.setNetInfo)
 
-	blid := b.backendLogID
+	blid := b.backendLogID.String()
 	b.logf("Backend: logs: be:%v fe:%v", blid, opts.FrontendLogID)
 	b.send(ipn.Notify{BackendLogID: &blid})
 	b.send(ipn.Notify{Prefs: &prefs})
@@ -2520,9 +2566,6 @@ func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
 		if version.IsSandboxedMacOS() {
 			return errors.New("The Tailscale SSH server does not run in sandboxed Tailscale GUI builds.")
 		}
-		if !envknob.UseWIPCode() {
-			return errors.New("The Tailscale SSH server is disabled on macOS tailscaled by default. To try, set env TAILSCALE_USE_WIP_CODE=1")
-		}
 	case "freebsd", "openbsd":
 	default:
 		return errors.New("The Tailscale SSH server is not supported on " + runtime.GOOS)
@@ -3115,6 +3158,12 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, prefs ipn.PrefsView, logf logger.
 	}
 
 	return dcfg
+}
+
+// SetTCPHandlerForFunnelFlow sets the TCP handler for Funnel flows.
+// It should only be called before the LocalBackend is used.
+func (b *LocalBackend) SetTCPHandlerForFunnelFlow(h func(src netip.AddrPort, dstPort uint16) (handler func(net.Conn))) {
+	b.getTCPHandlerForFunnelFlow = h
 }
 
 // SetVarRoot sets the root directory of Tailscale's writable
@@ -4654,7 +4703,10 @@ func (b *LocalBackend) Doctor(ctx context.Context, logf logger.Logf) {
 	logf = logger.SlowLoggerWithClock(ctx, logf, 20*time.Millisecond, 60, time.Now)
 
 	var checks []doctor.Check
-	checks = append(checks, routetable.Check{})
+	checks = append(checks,
+		permissions.Check{},
+		routetable.Check{},
+	)
 
 	// Print a log message if any of the global DNS resolvers are Tailscale
 	// IPs; this can interfere with our ability to connect to the Tailscale

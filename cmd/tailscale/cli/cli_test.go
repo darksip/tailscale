@@ -621,9 +621,16 @@ func TestPrefsFromUpArgs(t *testing.T) {
 		{
 			name: "error_long_hostname",
 			args: upArgsT{
-				hostname: strings.Repeat("a", 300),
+				hostname: strings.Repeat(strings.Repeat("a", 63)+".", 4),
 			},
-			wantErr: `hostname too long: 300 bytes (max 256)`,
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is too long to be a DNS name`,
+		},
+		{
+			name: "error_long_label",
+			args: upArgsT{
+				hostname: strings.Repeat("a", 64) + ".example.com",
+			},
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is not a valid DNS label`,
 		},
 		{
 			name: "error_linux_netfilter_empty",
@@ -1070,6 +1077,32 @@ func TestUpdatePrefs(t *testing.T) {
 				}
 			},
 			env: upCheckEnv{backendState: "Running"},
+		},
+		{
+			name:             "force_reauth_over_ssh_no_risk",
+			flags:            []string{"--force-reauth"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			env:          upCheckEnv{backendState: "Running"},
+			wantErrSubtr: "aborted, no changes made",
+		},
+		{
+			name:             "force_reauth_over_ssh",
+			flags:            []string{"--force-reauth", "--accept-risk=lose-ssh"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: nil,
+			env:            upCheckEnv{backendState: "Running"},
 		},
 	}
 	for _, tt := range tests {

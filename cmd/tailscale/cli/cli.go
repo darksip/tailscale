@@ -113,6 +113,7 @@ change in the future.
 			loginCmd,
 			logoutCmd,
 			switchCmd,
+			configureCmd,
 			netcheckCmd,
 			ipCmd,
 			statusCmd,
@@ -146,12 +147,12 @@ change in the future.
 	switch {
 	case slices.Contains(args, "debug"):
 		rootCmd.Subcommands = append(rootCmd.Subcommands, debugCmd)
+	case slices.Contains(args, "funnel"):
+		rootCmd.Subcommands = append(rootCmd.Subcommands, funnelCmd)
 	case slices.Contains(args, "serve"):
 		rootCmd.Subcommands = append(rootCmd.Subcommands, serveCmd)
 	case slices.Contains(args, "update"):
 		rootCmd.Subcommands = append(rootCmd.Subcommands, updateCmd)
-	case slices.Contains(args, "configure"):
-		rootCmd.Subcommands = append(rootCmd.Subcommands, configureCmd)
 	}
 	if runtime.GOOS == "linux" && distro.Get() == distro.Synology {
 		rootCmd.Subcommands = append(rootCmd.Subcommands, configureHostCmd)

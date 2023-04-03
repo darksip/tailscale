@@ -9,11 +9,21 @@ import (
 	"context"
 )
 
+const IsAvailable = false
+
 func withSockStats(ctx context.Context, label Label) context.Context {
 	return ctx
 }
 
 func get() *SockStats {
+	return nil
+}
+
+func getInterfaces() *InterfaceSockStats {
+	return nil
+}
+
+func getValidation() *ValidationSockStats {
 	return nil
 }
 

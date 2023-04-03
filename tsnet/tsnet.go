@@ -9,8 +9,10 @@ package tsnet
 import (
 	"context"
 	crand "crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -20,10 +22,12 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/exp/slices"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -37,18 +41,22 @@ import (
 	"tailscale.com/logpolicy"
 	"tailscale.com/logtail"
 	"tailscale.com/logtail/filch"
+	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/memnet"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/smallzstd"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/nettype"
 	"tailscale.com/util/mak"
 	"tailscale.com/wgengine"
 	"tailscale.com/wgengine/monitor"
 	"tailscale.com/wgengine/netstack"
 )
+
+func inTest() bool { return flag.Lookup("test.v") != nil }
 
 // Server is an embedded Tailscale server.
 //
@@ -79,7 +87,7 @@ type Server struct {
 	Logf logger.Logf
 
 	// Ephemeral, if true, specifies that the instance should register
-	// as an Ephemeral node (https://tailscale.com/kb/1111/ephemeral-nodes/).
+	// as an Ephemeral node (https://tailscale.com/s/ephemeral-nodes).
 	Ephemeral bool
 
 	// AuthKey, if non-empty, is the auth key to create the node
@@ -92,6 +100,8 @@ type Server struct {
 	// ControlURL optionally specifies the coordination server URL.
 	// If empty, the Tailscale default is used.
 	ControlURL string
+
+	getCertForTesting func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 
 	initOnce         sync.Once
 	initErr          error
@@ -107,13 +117,15 @@ type Server struct {
 	loopbackListener net.Listener           // optional loopback for localapi and proxies
 	localAPIListener net.Listener           // in-memory, used by localClient
 	localClient      *tailscale.LocalClient // in-memory
+	localAPIServer   *http.Server
 	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
-	logid            string
+	logid            logid.PublicID
 
 	mu        sync.Mutex
 	listeners map[listenKey]*listener
 	dialer    *tsdial.Dialer
+	closed    bool
 }
 
 // Dial connects to the address on the tailnet.
@@ -275,6 +287,14 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 				if len(status.TailscaleIPs) == 0 {
 					return nil, errors.New("tsnet.Up: running, but no ip")
 				}
+
+				// Clear the persisted serve config state to prevent stale configuration
+				// from code changes. This is a temporary workaround until we have a better
+				// way to handle this. (2023-03-11)
+				if err := lc.SetServeConfig(ctx, new(ipn.ServeConfig)); err != nil {
+					return nil, fmt.Errorf("tsnet.Up: %w", err)
+				}
+
 				return status, nil
 			}
 			// TODO: in the future, return an error on ipn.NeedsLogin
@@ -291,6 +311,11 @@ func (s *Server) Up(ctx context.Context) (*ipnstate.Status, error) {
 //
 // It must not be called before or concurrently with Start.
 func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("tsnet: %w", net.ErrClosed)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -303,6 +328,13 @@ func (s *Server) Close() error {
 		}
 		if s.logbuffer != nil {
 			s.logbuffer.Close()
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if s.localAPIServer != nil {
+			s.localAPIServer.Shutdown(ctx)
 		}
 	}()
 
@@ -338,14 +370,12 @@ func (s *Server) Close() error {
 		s.loopbackListener.Close()
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, ln := range s.listeners {
-		ln.Close()
+		ln.closeLocked()
 	}
-	s.listeners = nil
 
 	wg.Wait()
+	s.closed = true
 	return nil
 }
 
@@ -356,11 +386,26 @@ func (s *Server) doInit() {
 	}
 }
 
+// CertDomains returns the list of domains for which the server can
+// provide TLS certificates. These are also the DNS names for the
+// Server.
+// If the server is not running, it returns nil.
+func (s *Server) CertDomains() []string {
+	nm := s.lb.NetMap()
+	if nm == nil {
+		return nil
+	}
+	return slices.Clone(nm.DNS.CertDomains)
+}
+
 // TailscaleIPs returns IPv4 and IPv6 addresses for this node. If the node
 // has not yet joined a tailnet or is otherwise unaware of its own IP addresses,
 // the returned ip4, ip6 will be !netip.IsValid().
 func (s *Server) TailscaleIPs() (ip4, ip6 netip.Addr) {
 	nm := s.lb.NetMap()
+	if nm == nil {
+		return
+	}
 	for _, addr := range nm.Addresses {
 		ip := addr.Addr()
 		if ip.Is6() {
@@ -378,7 +423,10 @@ func (s *Server) getAuthKey() string {
 	if v := s.AuthKey; v != "" {
 		return v
 	}
-	return os.Getenv("TS_AUTHKEY")
+	if v := os.Getenv("TS_AUTHKEY"); v != "" {
+		return v
+	}
+	return os.Getenv("TS_AUTH_KEY")
 }
 
 func (s *Server) start() (reterr error) {
@@ -415,9 +463,9 @@ func (s *Server) start() (reterr error) {
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(s.rootPath, 0700); err != nil {
-			return err
-		}
+	}
+	if err := os.MkdirAll(s.rootPath, 0700); err != nil {
+		return err
 	}
 	if fi, err := os.Stat(s.rootPath); err != nil {
 		return err
@@ -425,44 +473,9 @@ func (s *Server) start() (reterr error) {
 		return fmt.Errorf("%v is not a directory", s.rootPath)
 	}
 
-	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
-
-	lpc, err := logpolicy.ConfigFromFile(cfgPath)
-	switch {
-	case os.IsNotExist(err):
-		lpc = logpolicy.NewConfig(logtail.CollectionNode)
-		if err := lpc.Save(cfgPath); err != nil {
-			return fmt.Errorf("logpolicy.Config.Save for %v: %w", cfgPath, err)
-		}
-	case err != nil:
-		return fmt.Errorf("logpolicy.LoadConfig for %v: %w", cfgPath, err)
+	if err := s.startLogger(&closePool); err != nil {
+		return err
 	}
-	if err := lpc.Validate(logtail.CollectionNode); err != nil {
-		return fmt.Errorf("logpolicy.Config.Validate for %v: %w", cfgPath, err)
-	}
-	s.logid = lpc.PublicID.String()
-
-	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
-	if err != nil {
-		return fmt.Errorf("error creating filch: %w", err)
-	}
-	closePool.add(s.logbuffer)
-	c := logtail.Config{
-		Collection: lpc.Collection,
-		PrivateID:  lpc.PrivateID,
-		Stderr:     io.Discard, // log everything to Buffer
-		Buffer:     s.logbuffer,
-		NewZstdEncoder: func() logtail.Encoder {
-			w, err := smallzstd.NewEncoder(nil)
-			if err != nil {
-				panic(err)
-			}
-			return w
-		},
-		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
-	}
-	s.logtail = logtail.NewLogger(c, logf)
-	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
 
 	s.linkMon, err = monitor.New(logf)
 	if err != nil {
@@ -491,7 +504,7 @@ func (s *Server) start() (reterr error) {
 		return fmt.Errorf("netstack.Create: %w", err)
 	}
 	ns.ProcessLocalIPs = true
-	ns.ForwardTCPIn = s.forwardTCP
+	ns.GetTCPHandlerForFlow = s.getTCPHandlerForFlow
 	ns.GetUDPHandlerForFlow = s.getUDPHandlerForFlow
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
@@ -519,6 +532,7 @@ func (s *Server) start() (reterr error) {
 	if err != nil {
 		return fmt.Errorf("NewLocalBackend: %v", err)
 	}
+	lb.SetTCPHandlerForFunnelFlow(s.getTCPHandlerForFunnelFlow)
 	lb.SetVarRoot(s.rootPath)
 	logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
@@ -560,12 +574,57 @@ func (s *Server) start() (reterr error) {
 	lal := memnet.Listen("local-tailscaled.sock:80")
 	s.localAPIListener = lal
 	s.localClient = &tailscale.LocalClient{Dial: lal.Dial}
+	s.localAPIServer = &http.Server{Handler: lah}
 	go func() {
-		if err := http.Serve(lal, lah); err != nil {
+		if err := s.localAPIServer.Serve(lal); err != nil {
 			logf("localapi serve error: %v", err)
 		}
 	}()
 	closePool.add(s.localAPIListener)
+	return nil
+}
+
+func (s *Server) startLogger(closePool *closeOnErrorPool) error {
+	if inTest() {
+		return nil
+	}
+	cfgPath := filepath.Join(s.rootPath, "tailscaled.log.conf")
+	lpc, err := logpolicy.ConfigFromFile(cfgPath)
+	switch {
+	case os.IsNotExist(err):
+		lpc = logpolicy.NewConfig(logtail.CollectionNode)
+		if err := lpc.Save(cfgPath); err != nil {
+			return fmt.Errorf("logpolicy.Config.Save for %v: %w", cfgPath, err)
+		}
+	case err != nil:
+		return fmt.Errorf("logpolicy.LoadConfig for %v: %w", cfgPath, err)
+	}
+	if err := lpc.Validate(logtail.CollectionNode); err != nil {
+		return fmt.Errorf("logpolicy.Config.Validate for %v: %w", cfgPath, err)
+	}
+	s.logid = lpc.PublicID
+
+	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
+	if err != nil {
+		return fmt.Errorf("error creating filch: %w", err)
+	}
+	closePool.add(s.logbuffer)
+	c := logtail.Config{
+		Collection: lpc.Collection,
+		PrivateID:  lpc.PrivateID,
+		Stderr:     io.Discard, // log everything to Buffer
+		Buffer:     s.logbuffer,
+		NewZstdEncoder: func() logtail.Encoder {
+			w, err := smallzstd.NewEncoder(nil)
+			if err != nil {
+				panic(err)
+			}
+			return w
+		},
+		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
+	}
+	s.logtail = logtail.NewLogger(c, s.logf)
+	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
 	return nil
 }
 
@@ -590,6 +649,25 @@ func (s *Server) logf(format string, a ...interface{}) {
 		return
 	}
 	log.Printf(format, a...)
+}
+
+// ReplaceGlobalLoggers will replace any Tailscale-specific package-global
+// loggers with this Server's logger. It returns a function that, when called,
+// will undo any changes made.
+//
+// Note that calling this function from multiple Servers will result in the
+// last call taking all logs; logs are not duplicated.
+func (s *Server) ReplaceGlobalLoggers() (undo func()) {
+	var undos []func()
+
+	oldDnsFallback := dnsfallback.SetLogger(s.logf)
+	undos = append(undos, func() { dnsfallback.SetLogger(oldDnsFallback) })
+
+	return func() {
+		for _, fn := range undos {
+			fn()
+		}
+	}
 }
 
 // printAuthURLLoop loops once every few seconds while the server is still running and
@@ -644,7 +722,7 @@ func networkForFamily(netBase string, is6 bool) string {
 //   - ("tcp", "", port)
 //
 // The netBase is "tcp" or "udp" (without any '4' or '6' suffix).
-func (s *Server) listenerForDstAddr(netBase string, dst netip.AddrPort) (_ *listener, ok bool) {
+func (s *Server) listenerForDstAddr(netBase string, dst netip.AddrPort, funnel bool) (_ *listener, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range [2]netip.Addr{0: dst.Addr()} {
@@ -652,7 +730,7 @@ func (s *Server) listenerForDstAddr(netBase string, dst netip.AddrPort) (_ *list
 			networkForFamily(netBase, dst.Addr().Is6()),
 			netBase,
 		} {
-			if ln, ok := s.listeners[listenKey{net, a, dst.Port()}]; ok {
+			if ln, ok := s.listeners[listenKey{net, a, dst.Port(), funnel}]; ok {
 				return ln, true
 			}
 		}
@@ -660,24 +738,37 @@ func (s *Server) listenerForDstAddr(netBase string, dst netip.AddrPort) (_ *list
 	return nil, false
 }
 
-func (s *Server) forwardTCP(c net.Conn, port uint16) {
-	dstStr := c.LocalAddr().String()
-	ap, err := netip.ParseAddrPort(dstStr)
-	if err != nil {
-		s.logf("unexpected dst addr %q", dstStr)
-		c.Close()
-		return
+func (s *Server) getTCPHandlerForFunnelFlow(src netip.AddrPort, dstPort uint16) (handler func(net.Conn)) {
+	ipv4, ipv6 := s.TailscaleIPs()
+	var dst netip.AddrPort
+	if src.Addr().Is4() {
+		if !ipv4.IsValid() {
+			return nil
+		}
+		dst = netip.AddrPortFrom(ipv4, dstPort)
+	} else {
+		if !ipv6.IsValid() {
+			return nil
+		}
+		dst = netip.AddrPortFrom(ipv6, dstPort)
 	}
-	ln, ok := s.listenerForDstAddr("tcp", ap)
+	ln, ok := s.listenerForDstAddr("tcp", dst, true)
 	if !ok {
-		c.Close()
-		return
+		return nil
 	}
-	ln.handle(c)
+	return ln.handle
+}
+
+func (s *Server) getTCPHandlerForFlow(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+	ln, ok := s.listenerForDstAddr("tcp", dst, false)
+	if !ok {
+		return nil, true // don't handle, don't forward to localhost
+	}
+	return ln.handle, true
 }
 
 func (s *Server) getUDPHandlerForFlow(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
-	ln, ok := s.listenerForDstAddr("udp", dst)
+	ln, ok := s.listenerForDstAddr("udp", dst, false)
 	if !ok {
 		return nil, true // don't handle, don't forward to localhost
 	}
@@ -746,6 +837,147 @@ func (s *Server) APIClient() (*tailscale.Client, error) {
 // Listen announces only on the Tailscale network.
 // It will start the server if it has not been started yet.
 func (s *Server) Listen(network, addr string) (net.Listener, error) {
+	return s.listen(network, addr, listenOnTailnet)
+}
+
+// ListenTLS announces only on the Tailscale network.
+// It returns a TLS listener wrapping the tsnet listener.
+// It will start the server if it has not been started yet.
+func (s *Server) ListenTLS(network, addr string) (net.Listener, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("ListenTLS(%q, %q): only tcp is supported", network, addr)
+	}
+	ctx := context.Background()
+	st, err := s.Up(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(st.CertDomains) == 0 {
+		return nil, errors.New("tsnet: you must enable HTTPS in the admin panel to proceed. See https://tailscale.com/s/https")
+	}
+
+	ln, err := s.listen(network, addr, listenOnTailnet)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, &tls.Config{
+		GetCertificate: s.getCert,
+	}), nil
+}
+
+// getCert is the GetCertificate function used by ListenTLS.
+//
+// It calls GetCertificate on the localClient, passing in the ClientHelloInfo.
+// For testing, if s.getCertForTesting is set, it will call that instead.
+func (s *Server) getCert(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if s.getCertForTesting != nil {
+		return s.getCertForTesting(hi)
+	}
+	lc, err := s.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	return lc.GetCertificate(hi)
+}
+
+// FunnelOption is an option passed to ListenFunnel to configure the listener.
+type FunnelOption interface {
+	funnelOption()
+}
+
+type funnelOnly int
+
+func (funnelOnly) funnelOption() {}
+
+// FunnelOnly configures the listener to only respond to connections from Tailscale Funnel.
+// The local tailnet will not be able to connect to the listener.
+func FunnelOnly() FunnelOption { return funnelOnly(1) }
+
+// ListenFunnel announces on the public internet using Tailscale Funnel.
+//
+// It also by default listens on your local tailnet, so connections can
+// come from either inside or outside your network. To restrict connections
+// to be just from the internet, use the FunnelOnly option.
+//
+// Currently (2023-03-10), Funnel only supports TCP on ports 443, 8443, and 10000.
+// The supported host name is limited to that configured for the tsnet.Server.
+// As such, the standard way to create funnel is:
+//
+//	s.ListenFunnel("tcp", ":443")
+//
+// and the only other supported addrs currently are ":8443" and ":10000".
+//
+// It will start the server if it has not been started yet.
+func (s *Server) ListenFunnel(network, addr string, opts ...FunnelOption) (net.Listener, error) {
+	if network != "tcp" {
+		return nil, fmt.Errorf("ListenFunnel(%q, %q): only tcp is supported", network, addr)
+	}
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if host != "" {
+		return nil, fmt.Errorf("ListenFunnel(%q, %q): host must be empty", network, addr)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+	st, err := s.Up(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := ipn.CheckFunnelAccess(uint16(port), st.Self.Capabilities); err != nil {
+		return nil, err
+	}
+
+	lc := s.localClient
+
+	// May not have funnel enabled. Enable it.
+	srvConfig, err := lc.GetServeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if srvConfig == nil {
+		srvConfig = &ipn.ServeConfig{}
+	}
+	domain := st.CertDomains[0]
+	hp := ipn.HostPort(domain + ":" + portStr)
+	if !srvConfig.AllowFunnel[hp] {
+		mak.Set(&srvConfig.AllowFunnel, hp, true)
+		srvConfig.AllowFunnel[hp] = true
+		if err := lc.SetServeConfig(ctx, srvConfig); err != nil {
+			return nil, err
+		}
+	}
+
+	// Start a funnel listener.
+	lnOn := listenOnBoth
+	for _, opt := range opts {
+		if _, ok := opt.(funnelOnly); ok {
+			lnOn = listenOnFunnel
+		}
+	}
+	ln, err := s.listen(network, addr, lnOn)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, &tls.Config{
+		GetCertificate: s.getCert,
+	}), nil
+}
+
+type listenOn string
+
+const (
+	listenOnTailnet = listenOn("listen-on-tailnet")
+	listenOnFunnel  = listenOn("listen-on-funnel")
+	listenOnBoth    = listenOn("listen-on-both")
+)
+
+func (s *Server) listen(network, addr string, lnOn listenOn) (net.Listener, error) {
 	switch network {
 	case "", "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
 	default:
@@ -780,20 +1012,37 @@ func (s *Server) Listen(network, addr string) (net.Listener, error) {
 		return nil, err
 	}
 
-	key := listenKey{network, bindHostOrZero, uint16(port)}
+	var keys []listenKey
+	switch lnOn {
+	case listenOnTailnet:
+		keys = append(keys, listenKey{network, bindHostOrZero, uint16(port), false})
+	case listenOnFunnel:
+		keys = append(keys, listenKey{network, bindHostOrZero, uint16(port), true})
+	case listenOnBoth:
+		keys = append(keys, listenKey{network, bindHostOrZero, uint16(port), false})
+		keys = append(keys, listenKey{network, bindHostOrZero, uint16(port), true})
+	}
+
 	ln := &listener{
 		s:    s,
-		key:  key,
+		keys: keys,
 		addr: addr,
 
 		conn: make(chan net.Conn),
 	}
 	s.mu.Lock()
-	if _, ok := s.listeners[key]; ok {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("tsnet: listener already open for %s, %s", network, addr)
+	for _, key := range keys {
+		if _, ok := s.listeners[key]; ok {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("tsnet: listener already open for %s, %s", network, addr)
+		}
 	}
-	mak.Set(&s.listeners, key, ln)
+	if s.listeners == nil {
+		s.listeners = make(map[listenKey]*listener)
+	}
+	for _, key := range keys {
+		s.listeners[key] = ln
+	}
 	s.mu.Unlock()
 	return ln, nil
 }
@@ -802,13 +1051,15 @@ type listenKey struct {
 	network string
 	host    netip.Addr // or zero value for unspecified
 	port    uint16
+	funnel  bool
 }
 
 type listener struct {
-	s    *Server
-	key  listenKey
-	addr string
-	conn chan net.Conn
+	s      *Server
+	keys   []listenKey
+	addr   string
+	conn   chan net.Conn
+	closed bool // guarded by s.mu
 }
 
 func (ln *listener) Accept() (net.Conn, error) {
@@ -820,13 +1071,26 @@ func (ln *listener) Accept() (net.Conn, error) {
 }
 
 func (ln *listener) Addr() net.Addr { return addr{ln} }
+
 func (ln *listener) Close() error {
 	ln.s.mu.Lock()
 	defer ln.s.mu.Unlock()
-	if v, ok := ln.s.listeners[ln.key]; ok && v == ln {
-		delete(ln.s.listeners, ln.key)
-		close(ln.conn)
+	return ln.closeLocked()
+}
+
+// closeLocked closes the listener.
+// It must be called with ln.s.mu held.
+func (ln *listener) closeLocked() error {
+	if ln.closed {
+		return fmt.Errorf("tsnet: %w", net.ErrClosed)
 	}
+	for _, key := range ln.keys {
+		if v, ok := ln.s.listeners[key]; ok && v == ln {
+			delete(ln.s.listeners, key)
+		}
+	}
+	close(ln.conn)
+	ln.closed = true
 	return nil
 }
 
@@ -847,5 +1111,5 @@ func (ln *listener) Server() *Server { return ln.s }
 
 type addr struct{ ln *listener }
 
-func (a addr) Network() string { return a.ln.key.network }
+func (a addr) Network() string { return a.ln.keys[0].network }
 func (a addr) String() string  { return a.ln.addr }

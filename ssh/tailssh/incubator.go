@@ -102,7 +102,7 @@ func (ss *sshSession) newIncubatorCommand() (cmd *exec.Cmd) {
 	ci := ss.conn.info
 	gids := strings.Join(ss.conn.userGroupIDs, ",")
 	remoteUser := ci.uprof.LoginName
-	if len(ci.node.Tags) > 0 {
+	if ci.node.IsTagged() {
 		remoteUser = strings.Join(ci.node.Tags, ",")
 	}
 
@@ -160,7 +160,7 @@ func (stdRWC) Close() error {
 }
 
 type incubatorArgs struct {
-	uid          uint64
+	uid          int
 	gid          int
 	groups       string
 	localUser    string
@@ -177,7 +177,7 @@ type incubatorArgs struct {
 
 func parseIncubatorArgs(args []string) (a incubatorArgs) {
 	flags := flag.NewFlagSet("", flag.ExitOnError)
-	flags.Uint64Var(&a.uid, "uid", 0, "the uid of local-user")
+	flags.IntVar(&a.uid, "uid", 0, "the uid of local-user")
 	flags.IntVar(&a.gid, "gid", 0, "the gid of local-user")
 	flags.StringVar(&a.groups, "groups", "", "comma-separated list of gids of local-user")
 	flags.StringVar(&a.localUser, "local-user", "", "the user to run as")
@@ -204,6 +204,16 @@ func parseIncubatorArgs(args []string) (a incubatorArgs) {
 // OS, sets its UID and groups to the specified `--uid`, `--gid` and
 // `--groups` and then launches the requested `--cmd`.
 func beIncubator(args []string) error {
+	// To defend against issues like https://golang.org/issue/1435,
+	// defensively lock our current goroutine's thread to the current
+	// system thread before we start making any UID/GID/group changes.
+	//
+	// This shouldn't matter on Linux because syscall.AllThreadsSyscall is
+	// used to invoke syscalls on all OS threads, but (as of 2023-03-23)
+	// that function is not implemented on all platforms.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	ia := parseIncubatorArgs(args)
 	if ia.isSFTP && ia.isShell {
 		return fmt.Errorf("--sftp and --shell are mutually exclusive")
@@ -217,7 +227,7 @@ func beIncubator(args []string) error {
 		}
 	}
 
-	euid := uint64(os.Geteuid())
+	euid := os.Geteuid()
 	runningAsRoot := euid == 0
 	if runningAsRoot && ia.loginCmdPath != "" {
 		// Check if we can exec into the login command instead of trying to
@@ -235,6 +245,7 @@ func beIncubator(args []string) error {
 	if err == nil && sessionCloser != nil {
 		defer sessionCloser()
 	}
+
 	var groupIDs []int
 	for _, g := range strings.Split(ia.groups, ",") {
 		gid, err := strconv.ParseInt(g, 10, 32)
@@ -244,22 +255,10 @@ func beIncubator(args []string) error {
 		groupIDs = append(groupIDs, int(gid))
 	}
 
-	if err := setGroups(groupIDs); err != nil {
+	if err := dropPrivileges(logf, ia.uid, ia.gid, groupIDs); err != nil {
 		return err
 	}
-	if egid := os.Getegid(); egid != ia.gid {
-		if err := syscall.Setgid(int(ia.gid)); err != nil {
-			logf(err.Error())
-			os.Exit(1)
-		}
-	}
-	if euid != ia.uid {
-		// Switch users if required before starting the desired process.
-		if err := syscall.Setuid(int(ia.uid)); err != nil {
-			logf(err.Error())
-			os.Exit(1)
-		}
-	}
+
 	if ia.isSFTP {
 		logf("handling sftp")
 
@@ -302,6 +301,118 @@ func beIncubator(args []string) error {
 		os.Exit(code)
 	}
 	return err
+}
+
+const (
+	// This controls whether we assert that our privileges were dropped
+	// using geteuid/getegid; it's a const and not an envknob because the
+	// incubator doesn't see the parent's environment.
+	//
+	// TODO(andrew): remove this const and always do this after sufficient
+	// testing, e.g. the 1.40 release
+	assertPrivilegesWereDropped = true
+
+	// TODO(andrew-d): verify that this works in more configurations before
+	// enabling by default.
+	assertPrivilegesWereDroppedByAttemptingToUnDrop = false
+)
+
+// dropPrivileges contains all the logic for dropping privileges to a different
+// UID, GID, and set of supplementary groups. This function is
+// security-sensitive and ordering-dependent; please be very cautious if/when
+// refactoring.
+//
+// WARNING: if you change this function, you *MUST* run the TestDropPrivileges
+// test in this package as root on at least Linux, FreeBSD and Darwin. This can
+// be done by running:
+//
+//	go test -c ./ssh/tailssh/ && sudo ./tailssh.test -test.v -test.run TestDropPrivileges
+func dropPrivileges(logf logger.Logf, wantUid, wantGid int, supplementaryGroups []int) error {
+	fatalf := func(format string, args ...any) {
+		logf("[unexpected] error dropping privileges: "+format, args...)
+		os.Exit(1)
+	}
+
+	euid := os.Geteuid()
+	egid := os.Getegid()
+
+	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" {
+		// On FreeBSD and Darwin, the first entry returned from the
+		// getgroups(2) syscall is the egid, and changing it with
+		// setgroups(2) changes the egid of the process. This is
+		// technically a violation of the POSIX standard; see the
+		// following article for more detail:
+		//    https://www.usenix.org/system/files/login/articles/325-tsafrir.pdf
+		//
+		// In this case, we add an entry at the beginning of the
+		// groupIDs list containing the expected gid if it's not
+		// already there, which modifies the egid and additional groups
+		// as one unit.
+		if len(supplementaryGroups) == 0 || supplementaryGroups[0] != wantGid {
+			supplementaryGroups = append([]int{wantGid}, supplementaryGroups...)
+		}
+	}
+
+	if err := setGroups(supplementaryGroups); err != nil {
+		return err
+	}
+	if egid != wantGid {
+		// On FreeBSD and Darwin, we may have already called the
+		// equivalent of setegid(wantGid) via the call to setGroups,
+		// above. However, per the manpage, setgid(getegid()) is an
+		// allowed operation regardless of privilege level.
+		//
+		// FreeBSD:
+		//	The setgid() system call is permitted if the specified ID
+		//	is equal to the real group ID or the effective group ID
+		//	of the process, or if the effective user ID is that of
+		//	the super user.
+		//
+		// Darwin:
+		//	The setgid() function is permitted if the effective
+		//	user ID is that of the super user, or if the specified
+		//	group ID is the same as the effective group ID.  If
+		//	not, but the specified group ID is the same as the real
+		//	group ID, setgid() will set the effective group ID to
+		//	the real group ID.
+		if err := syscall.Setgid(wantGid); err != nil {
+			fatalf("Setgid(%d): %v", wantGid, err)
+		}
+	}
+	if euid != wantUid {
+		// Switch users if required before starting the desired process.
+		if err := syscall.Setuid(wantUid); err != nil {
+			fatalf("Setuid(%d): %v", wantUid, err)
+		}
+	}
+
+	// If we changed either the UID or GID, defensively assert that we
+	// cannot reset the it back to our original values, and that the
+	// current egid/euid are the expected values after we change
+	// everything; if not, we exit the process.
+	if assertPrivilegesWereDroppedByAttemptingToUnDrop {
+		if egid != wantGid {
+			if err := syscall.Setegid(egid); err == nil {
+				fatalf("able to set egid back to %d", egid)
+			}
+		}
+		if euid != wantUid {
+			if err := syscall.Seteuid(euid); err == nil {
+				fatalf("able to set euid back to %d", euid)
+			}
+		}
+	}
+	if assertPrivilegesWereDropped {
+		if got := os.Getegid(); got != wantGid {
+			fatalf("got egid=%d, want %d", got, wantGid)
+		}
+		if got := os.Geteuid(); got != wantUid {
+			fatalf("got euid=%d, want %d", got, wantUid)
+		}
+		// TODO(andrew-d): assert that our supplementary groups are correct
+	}
+
+	return nil
 }
 
 // launchProcess launches an incubator process for the provided session.
