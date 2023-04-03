@@ -43,7 +43,8 @@ func Lookup(ctx context.Context, host string) ([]netip.Addr, error) {
 		ip      netip.Addr
 	}
 
-	dm := getDERPMap()
+	//dm := getDERPMap()
+	dm := new(tailcfg.DERPMap)
 
 	var cands4, cands6 []nameIP
 	for _, dr := range dm.Regions {

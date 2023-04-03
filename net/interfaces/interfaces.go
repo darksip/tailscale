@@ -102,7 +102,6 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 			continue
 		}
 		ifcIsLoopback := isLoopback(stdIf)
-
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return nil, nil, err
@@ -115,6 +114,7 @@ func LocalAddresses() (regular, loopback []netip.Addr, err error) {
 					continue
 				}
 				ip = ip.Unmap()
+
 				// TODO(apenwarr): don't special case cgNAT.
 				// In the general wireguard case, it might
 				// very well be something we can route to

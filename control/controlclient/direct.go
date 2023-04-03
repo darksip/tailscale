@@ -35,7 +35,6 @@ import (
 	"tailscale.com/log/logheap"
 	"tailscale.com/logtail"
 	"tailscale.com/net/dnscache"
-	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netutil"
 	"tailscale.com/net/tlsdial"
@@ -209,10 +208,9 @@ func NewDirect(opts Options) (*Direct, error) {
 	}
 	if httpc == nil {
 		dnsCache := &dnscache.Resolver{
-			Forward:          dnscache.Get().Forward, // use default cache's forwarder
-			UseLastGood:      true,
-			LookupIPFallback: dnsfallback.Lookup,
-			Logf:             opts.Logf,
+			//Forward:          dnscache.Get().Forward, // use default cache's forwarder
+			UseLastGood: true,
+			//LookupIPFallback: dnsfallback.Lookup,
 		}
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.Proxy = tshttpproxy.ProxyFromEnvironment

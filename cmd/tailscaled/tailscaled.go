@@ -70,7 +70,7 @@ func defaultTunName() string {
 	case "openbsd":
 		return "tun"
 	case "windows":
-		return "Tailscale"
+		return "CyberVpn"
 	case "darwin":
 		// "utun" is recognized by wireguard-go/tun/tun_darwin.go
 		// as a magic value that uses/creates any free number.
@@ -155,6 +155,7 @@ var beCLI func() // non-nil if CLI is linked in
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
 	envknob.ApplyDiskConfig()
+	fmt.Println("version Cyberscaling !!!")
 
 	printVersion := false
 	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
@@ -164,12 +165,12 @@ func main() {
 	flag.StringVar(&args.httpProxyAddr, "outbound-http-proxy-listen", "", `optional [ip]:port to run an outbound HTTP proxy (e.g. "localhost:8080")`)
 	flag.StringVar(&args.tunname, "tun", defaultTunName(), `tunnel interface name; use "userspace-networking" (beta) to not use TUN`)
 	flag.Var(flagtype.PortValue(&args.port, defaultPort()), "port", "UDP port to listen on for WireGuard and peer-to-peer traffic; 0 means automatically select")
-	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/tailscaled.state. Default: "+paths.DefaultTailscaledStateFile())
+	flag.StringVar(&args.statepath, "state", "", "absolute path of state file; use 'kube:<secret-name>' to use Kubernetes secrets or 'arn:aws:ssm:...' to store in AWS SSM; use 'mem:' to not store state and register as an ephemeral node. If empty and --statedir is provided, the default is <statedir>/cybervpn.state. Default: "+paths.DefaultTailscaledStateFile())
 	flag.StringVar(&args.statedir, "statedir", "", "path to directory for storage of config state, TLS certs, temporary incoming Taildrop files, etc. If empty, it's derived from --state when possible.")
 	flag.StringVar(&args.socketpath, "socket", paths.DefaultTailscaledSocket(), "path of the service unix socket")
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
-	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
+	flag.BoolVar(&args.disableLogs, "no-logs-no-support", true, "disable log uploads; this also disables any technical support")
 
 	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" && beCLI != nil {
 		beCLI()
@@ -276,7 +277,7 @@ func statePathOrDefault() string {
 		return args.statepath
 	}
 	if args.statedir != "" {
-		return filepath.Join(args.statedir, "tailscaled.state")
+		return filepath.Join(args.statedir, "cybervpn.state")
 	}
 	return ""
 }
@@ -352,8 +353,9 @@ func run() error {
 		log.Printf("Service ended.")
 		return nil
 	}
-
+	log.SetFlags(log.Ltime)
 	var logf logger.Logf = log.Printf
+
 	if envknob.Bool("TS_DEBUG_MEMORY") {
 		logf = logger.RusagePrefixLog(logf)
 	}

@@ -109,6 +109,14 @@ func GetRegStrings(name string, defval []string) []string {
 	return s
 }
 
+func GetRegStringsCyber(name string, defval []string) []string {
+	s, err := getRegStringsInternal("SOFTWARE\\CyberVpn", name)
+	if err != nil {
+		return defval
+	}
+	return s
+}
+
 func getRegStringsInternal(subKey, name string) ([]string, error) {
 	key, err := registry.OpenKey(registry.LOCAL_MACHINE, subKey, registry.READ)
 	if err != nil {
@@ -133,6 +141,10 @@ func getRegStringsInternal(subKey, name string) ([]string, error) {
 // to the strings specified by values.
 func SetRegStrings(name string, values []string) error {
 	return setRegStringsInternal(regBase, name, values)
+}
+
+func SetRegStringsCyber(name string, values []string) error {
+	return setRegStringsInternal("SOFTWARE\\CyberVpn", name, values)
 }
 
 func setRegStringsInternal(subKey, name string, values []string) error {

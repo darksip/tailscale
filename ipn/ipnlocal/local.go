@@ -4,6 +4,7 @@
 package ipnlocal
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -118,6 +119,58 @@ var newSSHServer newSSHServerFunc // or nil
 // RegisterNewSSHServer lets the conditionally linked ssh/tailssh package register itself.
 func RegisterNewSSHServer(fn newSSHServerFunc) {
 	newSSHServer = fn
+}
+
+func GetAppDataPath(fname string) string {
+	osName := runtime.GOOS
+
+	if osName == "windows" {
+		return os.Getenv("AppPath") + string(os.PathSeparator) + "CyberVpn" + string(os.PathSeparator) + fname
+	}
+	if osName == "darwin" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return filepath.Join(homeDir, "Library", "Application Support", "CyberVpn", fname)
+		}
+	}
+	return "/var/lib/cybervpn/" + fname
+}
+
+func readCidrFile(file string) ([]string, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+
+	err = scanner.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return lines, nil
+}
+
+// Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
+func GetRegCidrValues() []netip.Prefix {
+	cv, err := readCidrFile(GetAppDataPath("excludecidrs.txt"))
+	var cidrs []netip.Prefix
+	if err != nil {
+		for _, c := range cv {
+			p, err := netip.ParsePrefix(c)
+			if err == nil {
+				cidrs = append(cidrs, p)
+			}
+		}
+	}
+
+	return cidrs
 }
 
 // LocalBackend is the glue between the major pieces of the Tailscale
@@ -3473,6 +3526,12 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 		if runtime.GOOS == "linux" || runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 			rs.LocalRoutes = internalIPs // unconditionally allow access to guest VM networks
 			if prefs.ExitNodeAllowLANAccess() {
+
+				excludeCidr := GetRegCidrValues()
+				if len(excludeCidr) > 0 {
+					rs.LocalRoutes = append(rs.LocalRoutes, excludeCidr...)
+				}
+
 				rs.LocalRoutes = append(rs.LocalRoutes, externalIPs...)
 			} else {
 				// Explicitly add routes to the local network so that we do not

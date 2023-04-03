@@ -215,13 +215,13 @@ func LogsDir(logf logger.Logf) string {
 			// as a regular user (perhaps in userspace-networking/SOCK5 mode) and we should
 			// just use the %LocalAppData% instead. In a user context, %LocalAppData% isn't
 			// subject to random deletions from Windows system updates.
-			dir := filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+			dir := filepath.Join(os.Getenv("ProgramData"), "Cybervpn")
 			if winProgramDataAccessible(dir) {
 				logf("logpolicy: using dir %v", dir)
 				return dir
 			}
 		}
-		dir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+		dir := filepath.Join(os.Getenv("LocalAppData"), "Cybervpn")
 		logf("logpolicy: using LocalAppData dir %v", dir)
 		return dir
 	case "linux":
@@ -245,7 +245,7 @@ func LogsDir(logf logger.Logf) string {
 
 	cacheDir, err := os.UserCacheDir()
 	if err == nil {
-		d := filepath.Join(cacheDir, "Tailscale")
+		d := filepath.Join(cacheDir, "Cybervpn")
 		logf("logpolicy: using UserCacheDir, %q", d)
 		return d
 	}
@@ -507,13 +507,13 @@ func NewWithConfigPath(collection, dir, cmdName string) *Policy {
 			// %LocalAppData%\tailscaled.log.conf
 			//
 			// Attempt to migrate the log conf to C:\ProgramData\Tailscale
-			oldDir := filepath.Join(os.Getenv("LocalAppData"), "Tailscale")
+			oldDir := filepath.Join(os.Getenv("LocalAppData"), "CyberVpn")
 
-			oldPath := filepath.Join(oldDir, "tailscaled.log.conf")
+			oldPath := filepath.Join(oldDir, "CyberVpn.log.conf")
 			if fi, err := os.Stat(oldPath); err != nil || !fi.Mode().IsRegular() {
 				// *Only* if tailscaled.log.conf does not exist,
 				// check for tailscale-ipn.log.conf
-				oldPathOldCmd := filepath.Join(oldDir, "tailscale-ipn.log.conf")
+				oldPathOldCmd := filepath.Join(oldDir, "CyberVpn-ipn.log.conf")
 				if fi, err := os.Stat(oldPathOldCmd); err == nil && fi.Mode().IsRegular() {
 					oldPath = oldPathOldCmd
 				}
