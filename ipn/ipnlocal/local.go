@@ -125,7 +125,7 @@ func GetAppDataPath(fname string) string {
 	osName := runtime.GOOS
 
 	if osName == "windows" {
-		return os.Getenv("AppPath") + string(os.PathSeparator) + "CyberVpn" + string(os.PathSeparator) + fname
+		return os.Getenv("AppData") + string(os.PathSeparator) + "CyberVpn" + string(os.PathSeparator) + fname
 	}
 	if osName == "darwin" {
 		homeDir, err := os.UserHomeDir()
@@ -159,17 +159,19 @@ func readCidrFile(file string) ([]string, error) {
 
 // Create or Read the list of cidr to exclude from routing in Tailscale when Exit Node is active
 func GetRegCidrValues() []netip.Prefix {
+	log.Println("reading excludecidrs.txt...")
 	cv, err := readCidrFile(GetAppDataPath("excludecidrs.txt"))
 	var cidrs []netip.Prefix
-	if err != nil {
+	if err == nil {
 		for _, c := range cv {
 			p, err := netip.ParsePrefix(c)
 			if err == nil {
 				cidrs = append(cidrs, p)
 			}
 		}
+	} else {
+		log.Printf(err.Error())
 	}
-
 	return cidrs
 }
 
@@ -3529,6 +3531,7 @@ func (b *LocalBackend) routerConfig(cfg *wgcfg.Config, prefs ipn.PrefsView, oneC
 
 				excludeCidr := GetRegCidrValues()
 				if len(excludeCidr) > 0 {
+					log.Printf("adding to local routes %d...", len(excludeCidr))
 					rs.LocalRoutes = append(rs.LocalRoutes, excludeCidr...)
 				}
 
